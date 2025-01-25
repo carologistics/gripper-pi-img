@@ -5,6 +5,8 @@ import cv2
 import numpy as np
 import io
 from ultralytics import YOLO
+import ncnn
+from utils import ncnn_inference, DEFAULT_CLASS_NAMES
 import base64
 import struct
 import time
@@ -58,7 +60,7 @@ STREAM_RAW = True
 STREAM_MARKED = True
 SAVE_IMG_ONCE = False
 DETECT = True
-OBJECT = 2
+OBJECT = 3
 CONFIDENCE_THRESHOLD = 0.2
 IOU = 0.3
 ROTATION = 270
@@ -81,7 +83,11 @@ OUTPUT_DIR = 'images'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 # model = YOLO('new.pt',task='detect')
 # model.export(format="ncnn")
-ncnn_model = YOLO('model_ncnn_model', task='detect')
+# ncnn_model = YOLO('model_ncnn_model', task='detect')
+
+ncnn_model = ncnn.Net()
+ncnn_model.load_param(r"model_ncnn_model/model.ncnn.param")
+ncnn_model.load_model(r"model_ncnn_model/model.ncnn.bin")
 
 def ntohf(message):
     net_float, = struct.unpack('!I', message)
@@ -106,6 +112,15 @@ def send_frame_to_all(clients, frame, timestamp, msg_type):
 
     # broadcast the message
     send_to_all(clients, message)
+
+def draw_detections(frame, detections):
+    for detection in detections:
+        box = detection.bounds
+        cv2.rectangle(frame, (int(box.x), int(box.y)), 
+                      (int(box.x + box.width), int(box.y + box.height)), (0, 0, 255), 3)
+        label = f"{detection.class_name} ({round(detection.confidence * 100, 2)}%)"
+        cv2.putText(frame, label, (int(box.x), int(box.y) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
 try:
     cam = None
@@ -169,7 +184,7 @@ try:
                                 print("Switched to workpiece detection")
                             elif message_type == 9:
                                 DETECT = True
-                                OBJECT = 0
+                                OBJECT = 3
                                 print("Switched to conveyor detection")
                             elif message_type == 10:
                                 DETECT = True
@@ -265,37 +280,49 @@ try:
 
                 # the detection is supposed to run and the results will be sent to all connected clients
                 if DETECT:
-                    results=ncnn_model.track(frame, persist=True, iou=IOU)
-                    if STREAM_MARKED:
-                        send_frame_to_all(clients, results[0].plot(), timestamp, 2)
-        
-                    boxes = results[0].boxes 
-                    confidences = results[0].boxes.conf
-                    class_ids = results[0].boxes.cls
-                    shapes = results[0].boxes.xywh.numpy()
-                    
-                    # Filter detections
-                    filtered_indices = [
-                        i for i, conf in enumerate(confidences)
-                        if conf >= CONFIDENCE_THRESHOLD and class_ids[i] == OBJECT
-                    ]
-
+                    # infer
+                    results, infer_time = ncnn_inference(frame, ncnn_model, 640, threshold=CONFIDENCE_THRESHOLD, nms_threshold=IOU)
                     # Create a copy of the frame to plot filtered results
                     filtered_frame = frame.copy()
-                    for i in filtered_indices:
-                        box = boxes[i]
-                        class_id = class_ids[i]
-                        x=shapes[i][0]/frame.shape[1];
-                        y=shapes[i][1]/frame.shape[0];
-                        w=shapes[i][2]/frame.shape[1];
-                        h=shapes[i][3]/frame.shape[0];
+                    if results:
+                        boxes=[]
+                        class_ids=[]
+                        confidences=[]
+                        # results=ncnn_model.track(frame, persist=True, iou=IOU)
+                        if STREAM_MARKED:
+                            draw_detections(filtered_frame,results)
+                            send_frame_to_all(clients, filtered_frame, timestamp, 2)
+                        for result in results:
+                            boxes.append(result.bounds)
+                            confidences.append(round(result.confidence * 100, 2))
+                            class_ids.append(result.class_name)
 
-                        detection_message = struct.pack('!BQfffffI', 3, timestamp, x, y, h, w, float(confidences[i]), int(class_id))
-                        send_to_all(clients,detection_message)
-                    if not filtered_indices:
-                        # send an empty box at least to trigger an update
-                        detection_message = struct.pack('!BQfffffI', 3, timestamp, 0, 0, 0, 0, 0, 0)
-                        send_to_all(clients,detection_message)
+                        # Filter detections
+                        filtered_indices = [
+                            i for i, conf in enumerate(confidences)
+                            if conf >= CONFIDENCE_THRESHOLD and DEFAULT_CLASS_NAMES.index(class_ids[i]) == OBJECT
+                        ]
+                        print(confidences)
+                        for i, conf in enumerate(confidences):
+                            print(DEFAULT_CLASS_NAMES.index(class_ids[i]))
+                        print(filtered_indices)
+                        for i in filtered_indices:
+                            box = boxes[i]
+                            class_id = DEFAULT_CLASS_NAMES.index(class_ids[i])
+                            x=box.x;
+                            y=box.y;
+                            w=box.width;
+                            h=box.height;
+                            print(x, y, h, w, float(confidences[i]), int(class_id))
+                            detection_message = struct.pack('!BQfffffI', 3, timestamp, x, y, h, w, float(confidences[i]), int(class_id))
+                            send_to_all(clients,detection_message)
+                        boxes=[]
+                        class_ids=[]
+                        confidences=[]
+                        if not filtered_indices:
+                            # send an empty box at least to trigger an update
+                            detection_message = struct.pack('!BQfffffI', 3, timestamp, 0, 0, 0, 0, 0, 0)
+                            send_to_all(clients,detection_message)
 
                 if IMSHOW:
                     cv2.imshow('video', frame)
